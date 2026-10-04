@@ -1,4 +1,4 @@
-# salesforce-aes256-data-masking-in-flow
+# salesforce-aes256-encryption-in-flow
 
 The script template offers a Salesforce admin-configurable utility designed for Salesforce Flows. It is an automated, native solution built to protect Personal Information (PI) within Salesforce environments by masking values in the user interface to prevent visual exposure and securely capturing tamper-evident audit logs. 
 
