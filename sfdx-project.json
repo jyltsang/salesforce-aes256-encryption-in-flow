@@ -1,0 +1,11 @@
+{
+  "packageDirectories": [
+    {
+      "path": "force-app",
+      "default": true
+    }
+  ],
+  "name": "salesforce-aes256-encryption-in-flow",
+  "namespace": "",
+  "sourceApiVersion": "66.0"
+}
