@@ -9,6 +9,12 @@ public with sharing class FlowAES256DataUnmaskingAction {
 
         @InvocableVariable(required=true label='Checkbox Field' description='API Name of the checkbox status field to reset')
         public String statusCheckboxFieldName;
+
+        @InvocableVariable(label='Key Name' description='Optional. Symmetric Key Config record for logs that do not name their key (written before key names were logged). Defaults to Default_Key.')
+        public String keyName;
+
+        @InvocableVariable(label='All or None' description='Optional. True (default): if any record fails, no record in this request is changed. False: valid records are restored and failures are reported.')
+        public Boolean allOrNone;
     }
 
     public class UnmaskResult {
@@ -17,113 +23,140 @@ public with sharing class FlowAES256DataUnmaskingAction {
 
         @InvocableVariable(label='Message')
         public String message;
+
+        @InvocableVariable(label='Processed Count' description='Records restored and saved')
+        public Integer processedCount;
+
+        @InvocableVariable(label='Skipped Count' description='Records left as they were because they had nothing to unmask')
+        public Integer skippedCount;
+
+        @InvocableVariable(label='Failed Count' description='Records left masked with their log intact')
+        public Integer failedCount;
+
+        @InvocableVariable(label='Failed Record Ids' description='Ids of the records left masked')
+        public List<String> failedRecordIds;
+    }
+
+    // Validated settings for one request, kept alongside its outcome
+    private class Plan {
+        public FlowAES256Service.Outcome outcome;
+        public Map<String, Schema.SObjectField> fieldMap;
+        public String encField;
+        public String statusField;
+        public String fallbackKeyName;
     }
 
     @InvocableMethod(label='AES256 Decrypt and Unmask Record Fields' description='Reads the encrypted audit log, decrypts fields using Custom Metadata AES key, restores original values, and clears the log.')
     public static List<UnmaskResult> processRecords(List<UnmaskRequest> requests) {
-        List<UnmaskResult> results = new List<UnmaskResult>();
-
-        // Retrieve AES key dynamically from Custom Metadata Type
-        Blob keyBlob;
-        try {
-            keyBlob = FlowAES256Util.getKey();
-        } catch (FlowAES256Util.AES256Exception e) {
-            for (UnmaskRequest req : requests) {
-                results.add(result(false, 'ERROR: ' + e.getMessage()));
-            }
-            return results;
-        }
+        List<Plan> plans = new List<Plan>();
+        List<FlowAES256Service.Outcome> outcomes = new List<FlowAES256Service.Outcome>();
 
         for (UnmaskRequest req : requests) {
+            Plan plan = new Plan();
+            plan.outcome = new FlowAES256Service.Outcome(req.allOrNone);
             try {
-                results.add(unmaskRecords(req, keyBlob));
+                prepare(plan, req);
             } catch (Exception e) {
-                results.add(result(false, 'ERROR: ' + e.getMessage()));
+                plan.outcome.reject(e.getMessage());
+            }
+            plans.add(plan);
+            outcomes.add(plan.outcome);
+        }
+
+        try {
+            FlowAES256Service.claimRecords(outcomes);
+            Map<Id, SObject> recordsById = FlowAES256Service.queryRecords(outcomes);
+
+            for (Plan plan : plans) {
+                if (!plan.outcome.isActive()) continue;
+                buildChanges(plan, recordsById);
+                plan.outcome.abandonIfAllOrNone();
+            }
+
+            FlowAES256Service.save(outcomes);
+        } catch (Exception e) {
+            // Unexpected failure shared by the whole batch, e.g. a query error
+            for (FlowAES256Service.Outcome outcome : outcomes) {
+                if (outcome.isActive()) outcome.reject(e.getMessage());
             }
         }
 
+        List<UnmaskResult> results = new List<UnmaskResult>();
+        for (Plan plan : plans) {
+            results.add(toResult(plan.outcome));
+        }
         return results;
     }
 
-    private static UnmaskResult unmaskRecords(UnmaskRequest req, Blob keyBlob) {
-        if (req.recordsToUnmask == null || req.recordsToUnmask.isEmpty()) {
-            return result(false, 'No records provided in the collection.');
+    private static void prepare(Plan plan, UnmaskRequest req) {
+        FlowAES256Service.Outcome outcome = plan.outcome;
+        FlowAES256Service.collectRecords(outcome, req.recordsToUnmask);
+        if (!outcome.isActive()) return;
+        if (outcome.recordIds.isEmpty()) {
+            outcome.reject('No records provided in the collection.');
+            return;
         }
 
-        Schema.SObjectType sObjectType = req.recordsToUnmask[0].getSObjectType();
-        String objectName = sObjectType.getDescribe().getName();
-        Map<String, Schema.SObjectField> fieldMap = sObjectType.getDescribe().fields.getMap();
+        String objectName = outcome.sObjectType.getDescribe().getName();
+        plan.fieldMap = outcome.sObjectType.getDescribe().fields.getMap();
+        plan.encField = FlowAES256Util.requireField(
+            plan.fieldMap, req.encryptedLogFieldName, objectName, 'Log field', FlowAES256Util.LOG_FIELD_TYPES, 'a text area field').getName();
+        plan.statusField = FlowAES256Util.requireField(
+            plan.fieldMap, req.statusCheckboxFieldName, objectName, 'Checkbox field', FlowAES256Util.STATUS_FIELD_TYPES, 'a checkbox').getName();
+        plan.fallbackKeyName = FlowAES256Util.resolveKeyName(req.keyName);
 
-        String encField = FlowAES256Util.requireField(
-            fieldMap, req.encryptedLogFieldName, objectName, 'Log field', FlowAES256Util.LOG_FIELD_TYPES, 'a text area field').getName();
-        String statusField = FlowAES256Util.requireField(
-            fieldMap, req.statusCheckboxFieldName, objectName, 'Checkbox field', FlowAES256Util.STATUS_FIELD_TYPES, 'a checkbox').getName();
+        outcome.queryFields.add(plan.encField);
+        outcome.queryFields.add(plan.statusField);
+    }
 
-        Set<Id> recordIds = new Set<Id>();
-        for (SObject sObj : req.recordsToUnmask) {
-            if (sObj != null && sObj.Id != null) recordIds.add(sObj.Id);
-        }
+    private static void buildChanges(Plan plan, Map<Id, SObject> recordsById) {
+        FlowAES256Service.Outcome outcome = plan.outcome;
 
-        // Query live records including the log field
-        String soql = 'SELECT Id, ' + encField + ', ' + statusField + ' FROM ' + objectName + ' WHERE Id IN :recordIds';
+        for (Id recordId : outcome.recordIds) {
+            SObject record = recordsById.get(recordId);
+            if (record == null) continue;
 
-        List<SObject> recordsToUpdate = new List<SObject>();
-        List<String> failures = new List<String>();
-
-        for (SObject record : Database.query(soql)) {
-            String logContent = (String) record.get(encField);
+            String logContent = (String) record.get(plan.encField);
             if (String.isBlank(logContent)) {
-                // Masked while every target field was empty, so there is nothing to restore
-                if ((Boolean) record.get(statusField) == true) {
-                    SObject reset = sObjectType.newSObject(record.Id);
-                    reset.put(statusField, false);
-                    recordsToUpdate.add(reset);
+                if ((Boolean) record.get(plan.statusField) == true) {
+                    // Masked while every target field was empty, so only the checkbox needs resetting
+                    SObject reset = outcome.sObjectType.newSObject(recordId);
+                    reset.put(plan.statusField, false);
+                    outcome.changes.add(reset);
+                } else {
+                    outcome.skippedCount++;
                 }
                 continue;
             }
 
             // A record is restored only if every line decrypts; otherwise its log is kept so no data is lost
             try {
-                recordsToUpdate.add(restoreRecord(sObjectType, fieldMap, record.Id, logContent, keyBlob, encField, statusField));
+                outcome.changes.add(restoreRecord(plan, recordId, logContent));
             } catch (Exception e) {
-                failures.add(record.Id + ' (' + e.getMessage() + ')');
+                outcome.fail(recordId, e.getMessage());
             }
         }
-
-        if (!recordsToUpdate.isEmpty()) {
-            update recordsToUpdate;
-        }
-
-        if (!failures.isEmpty()) {
-            return result(false, 'ERROR: Unmasked ' + recordsToUpdate.size() + ' records. '
-                + failures.size() + ' records were left masked with their log intact: ' + String.join(failures, '; '));
-        }
-        if (recordsToUpdate.isEmpty()) {
-            return result(false, 'No valid encrypted logs found to decrypt.');
-        }
-        return result(true, 'SUCCESS: Unmasked ' + recordsToUpdate.size() + ' records.');
     }
 
     // Parses the multiline log format 'FieldName: EncryptedBase64String' into a record ready to update
-    private static SObject restoreRecord(
-        Schema.SObjectType sObjectType,
-        Map<String, Schema.SObjectField> fieldMap,
-        Id recordId,
-        String logContent,
-        Blob keyBlob,
-        String encField,
-        String statusField
-    ) {
-        SObject restored = sObjectType.newSObject(recordId);
+    private static SObject restoreRecord(Plan plan, Id recordId, String logContent) {
+        SObject restored = plan.outcome.sObjectType.newSObject(recordId);
+        List<String> lines = FlowAES256Util.splitLogLines(logContent);
 
-        for (String line : FlowAES256Util.splitLogLines(logContent)) {
+        // Logs name the key that encrypted them, so they still decrypt after the default key is rotated
+        String loggedKeyName = FlowAES256Util.readKeyName(lines);
+        if (loggedKeyName != null) lines.remove(0);
+        String keyName = loggedKeyName != null ? loggedKeyName : plan.fallbackKeyName;
+        Blob keyBlob = FlowAES256Util.getKey(keyName);
+
+        for (String line : lines) {
             Integer separatorIndex = line.indexOf(FlowAES256Util.LOG_SEPARATOR);
             if (separatorIndex < 1) {
                 throw new FlowAES256Util.AES256Exception('unreadable log line');
             }
 
             String fieldName = line.left(separatorIndex).trim();
-            Schema.DescribeFieldResult fieldDescribe = FlowAES256Util.describeField(fieldMap, fieldName);
+            Schema.DescribeFieldResult fieldDescribe = FlowAES256Util.describeField(plan.fieldMap, fieldName);
             if (fieldDescribe == null || !fieldDescribe.isUpdateable()) {
                 throw new FlowAES256Util.AES256Exception(fieldName + ' does not exist or is not editable');
             }
@@ -133,7 +166,7 @@ public with sharing class FlowAES256DataUnmaskingAction {
                 originalVal = FlowAES256Util.decrypt(keyBlob, line.substring(separatorIndex + FlowAES256Util.LOG_SEPARATOR.length()).trim());
             } catch (Exception decryptEx) {
                 throw new FlowAES256Util.AES256Exception('could not decrypt ' + fieldName
-                    + '; the log may have been altered or the key changed');
+                    + ' with key ' + keyName + '; the log may have been altered or the key changed');
             }
 
             try {
@@ -144,15 +177,24 @@ public with sharing class FlowAES256DataUnmaskingAction {
         }
 
         // Clear the log and reset status checkbox
-        restored.put(encField, null);
-        restored.put(statusField, false);
+        restored.put(plan.encField, null);
+        restored.put(plan.statusField, false);
         return restored;
     }
 
-    private static UnmaskResult result(Boolean isSuccess, String message) {
+    private static UnmaskResult toResult(FlowAES256Service.Outcome outcome) {
         UnmaskResult res = new UnmaskResult();
-        res.isSuccess = isSuccess;
-        res.message = message;
+        res.isSuccess = outcome.isSuccess();
+        res.message = outcome.message('Unmasked', 'records with nothing to unmask');
+        // Nothing restored and nothing failed: report it as before, so Flows can branch on it
+        if (res.isSuccess && outcome.processedCount == 0) {
+            res.isSuccess = false;
+            res.message = 'No valid encrypted logs found to decrypt.';
+        }
+        res.processedCount = outcome.processedCount;
+        res.skippedCount = outcome.skippedCount;
+        res.failedCount = outcome.failedCount();
+        res.failedRecordIds = outcome.failedRecordIds;
         return res;
     }
 }

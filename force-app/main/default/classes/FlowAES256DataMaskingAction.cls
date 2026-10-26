@@ -12,6 +12,15 @@ public with sharing class FlowAES256DataMaskingAction {
 
         @InvocableVariable(required=true label='Checkbox Field' description='API Name of the checkbox status field')
         public String statusCheckboxFieldName;
+
+        @InvocableVariable(label='Key Name' description='Optional. Name of the Symmetric Key Config record to encrypt with. Defaults to Default_Key.')
+        public String keyName;
+
+        @InvocableVariable(label='Mask Placeholder' description='Optional. Text written into required text fields, which cannot be blanked. Defaults to *****.')
+        public String maskPlaceholder;
+
+        @InvocableVariable(label='All or None' description='Optional. True (default): if any record fails, no record in this request is changed. False: valid records are saved and failures are reported.')
+        public Boolean allOrNone;
     }
 
     public class MaskResult {
@@ -20,53 +29,97 @@ public with sharing class FlowAES256DataMaskingAction {
 
         @InvocableVariable(label='Message')
         public String message;
+
+        @InvocableVariable(label='Processed Count' description='Records masked and saved')
+        public Integer processedCount;
+
+        @InvocableVariable(label='Skipped Count' description='Records left as they were because they were already masked')
+        public Integer skippedCount;
+
+        @InvocableVariable(label='Failed Count' description='Records that were not masked')
+        public Integer failedCount;
+
+        @InvocableVariable(label='Failed Record Ids' description='Ids of the records that were not masked')
+        public List<String> failedRecordIds;
+    }
+
+    // Validated settings for one request, kept alongside its outcome
+    private class Plan {
+        public FlowAES256Service.Outcome outcome;
+        public List<Schema.DescribeFieldResult> targetFields = new List<Schema.DescribeFieldResult>();
+        public Schema.DescribeFieldResult logField;
+        public String statusField;
+        public String keyName;
+        public Blob key;
+        public String placeholder;
     }
 
     @InvocableMethod(label='AES256 Encrypt and Mask Record Fields' description='Encrypts field values into a log using Custom Metadata AES key, then wipes target fields on a collection of records.')
     public static List<MaskResult> processRecords(List<MaskRequest> requests) {
-        List<MaskResult> results = new List<MaskResult>();
-
-        // Retrieve AES key dynamically from Custom Metadata Type
-        Blob keyBlob;
-        try {
-            keyBlob = FlowAES256Util.getKey();
-        } catch (FlowAES256Util.AES256Exception e) {
-            for (MaskRequest req : requests) {
-                results.add(result(false, 'ERROR: ' + e.getMessage()));
-            }
-            return results;
-        }
+        List<Plan> plans = new List<Plan>();
+        List<FlowAES256Service.Outcome> outcomes = new List<FlowAES256Service.Outcome>();
 
         for (MaskRequest req : requests) {
+            Plan plan = new Plan();
+            plan.outcome = new FlowAES256Service.Outcome(req.allOrNone);
             try {
-                results.add(maskRecords(req, keyBlob));
+                prepare(plan, req);
             } catch (Exception e) {
-                results.add(result(false, 'ERROR: ' + e.getMessage()));
+                plan.outcome.reject(e.getMessage());
+            }
+            plans.add(plan);
+            outcomes.add(plan.outcome);
+        }
+
+        try {
+            FlowAES256Service.claimRecords(outcomes);
+            Map<Id, SObject> recordsById = FlowAES256Service.queryRecords(outcomes);
+
+            for (Plan plan : plans) {
+                if (!plan.outcome.isActive()) continue;
+                buildChanges(plan, recordsById);
+                plan.outcome.abandonIfAllOrNone();
+            }
+
+            FlowAES256Service.save(outcomes);
+        } catch (Exception e) {
+            // Unexpected failure shared by the whole batch, e.g. a query error
+            for (FlowAES256Service.Outcome outcome : outcomes) {
+                if (outcome.isActive()) outcome.reject(e.getMessage());
             }
         }
 
+        List<MaskResult> results = new List<MaskResult>();
+        for (Plan plan : plans) {
+            results.add(toResult(plan.outcome));
+        }
         return results;
     }
 
-    private static MaskResult maskRecords(MaskRequest req, Blob keyBlob) {
-        if (req.recordsToMask == null || req.recordsToMask.isEmpty()) {
-            return result(false, 'No records provided in the collection.');
+    // Validates the request before any data is touched, so a typo never leaves PI unmasked silently
+    private static void prepare(Plan plan, MaskRequest req) {
+        FlowAES256Service.Outcome outcome = plan.outcome;
+        FlowAES256Service.collectRecords(outcome, req.recordsToMask);
+        if (!outcome.isActive()) return;
+        if (outcome.recordIds.isEmpty()) {
+            outcome.reject('No records provided in the collection.');
+            return;
         }
 
-        Schema.SObjectType sObjectType = req.recordsToMask[0].getSObjectType();
-        String objectName = sObjectType.getDescribe().getName();
-        Map<String, Schema.SObjectField> fieldMap = sObjectType.getDescribe().fields.getMap();
+        plan.keyName = FlowAES256Util.resolveKeyName(req.keyName);
+        plan.key = FlowAES256Util.getKey(plan.keyName);
+        plan.placeholder = req.maskPlaceholder;
 
-        Schema.DescribeFieldResult logField = FlowAES256Util.requireField(
+        String objectName = outcome.sObjectType.getDescribe().getName();
+        Map<String, Schema.SObjectField> fieldMap = outcome.sObjectType.getDescribe().fields.getMap();
+
+        plan.logField = FlowAES256Util.requireField(
             fieldMap, req.encryptedLogFieldName, objectName, 'Log field', FlowAES256Util.LOG_FIELD_TYPES, 'a text area field');
-        Schema.DescribeFieldResult statusField = FlowAES256Util.requireField(
-            fieldMap, req.statusCheckboxFieldName, objectName, 'Checkbox field', FlowAES256Util.STATUS_FIELD_TYPES, 'a checkbox');
-        String encField = logField.getName();
-        String statusFieldName = statusField.getName();
+        plan.statusField = FlowAES256Util.requireField(
+            fieldMap, req.statusCheckboxFieldName, objectName, 'Checkbox field', FlowAES256Util.STATUS_FIELD_TYPES, 'a checkbox').getName();
+        String encField = plan.logField.getName();
 
-        // Validate every target field before touching data, so a typo never leaves PI unmasked silently
-        List<Schema.DescribeFieldResult> targetFields = new List<Schema.DescribeFieldResult>();
-        Set<String> seenFields = new Set<String>{ encField.toLowerCase(), statusFieldName.toLowerCase() };
+        Set<String> seenFields = new Set<String>{ encField.toLowerCase(), plan.statusField.toLowerCase() };
         List<String> problems = new List<String>();
 
         for (String fieldName : resolveFieldNames(req.fieldNamesCollection)) {
@@ -76,7 +129,7 @@ public with sharing class FlowAES256DataMaskingAction {
                 continue;
             }
             String apiName = fieldDescribe.getName();
-            if (apiName == encField || apiName == statusFieldName) {
+            if (apiName == encField || apiName == plan.statusField) {
                 problems.add(apiName + ' is the log or checkbox field and cannot be masked');
                 continue;
             }
@@ -90,77 +143,76 @@ public with sharing class FlowAES256DataMaskingAction {
             } else if (!FlowAES256Util.canMask(fieldDescribe)) {
                 problems.add(apiName + ' is a required ' + fieldDescribe.getType() + ' field and cannot be blanked');
             } else {
-                targetFields.add(fieldDescribe);
+                plan.targetFields.add(fieldDescribe);
             }
         }
 
         if (!problems.isEmpty()) {
-            return result(false, 'ERROR: No records changed. ' + String.join(problems, '; ') + '.');
+            outcome.reject('No records changed. ' + String.join(problems, '; ') + '.');
+            return;
         }
-        if (targetFields.isEmpty()) {
-            return result(false, 'ERROR: No fields provided to mask.');
-        }
-
-        Set<Id> recordIds = new Set<Id>();
-        for (SObject sObj : req.recordsToMask) {
-            if (sObj != null && sObj.Id != null) recordIds.add(sObj.Id);
+        if (plan.targetFields.isEmpty()) {
+            outcome.reject('No fields provided to mask.');
+            return;
         }
 
-        List<String> queryFields = new List<String>{ 'Id', encField, statusFieldName };
-        for (Schema.DescribeFieldResult fieldDescribe : targetFields) {
-            queryFields.add(fieldDescribe.getName());
+        outcome.queryFields.add(encField);
+        outcome.queryFields.add(plan.statusField);
+        for (Schema.DescribeFieldResult fieldDescribe : plan.targetFields) {
+            outcome.queryFields.add(fieldDescribe.getName());
         }
+    }
 
-        String soql = 'SELECT ' + String.join(queryFields, ', ') +
-                      ' FROM ' + objectName + ' WHERE Id IN :recordIds';
+    private static void buildChanges(Plan plan, Map<Id, SObject> recordsById) {
+        FlowAES256Service.Outcome outcome = plan.outcome;
+        String encField = plan.logField.getName();
 
-        List<SObject> recordsToUpdate = new List<SObject>();
-        Integer alreadyMasked = 0;
+        for (Id recordId : outcome.recordIds) {
+            SObject record = recordsById.get(recordId);
+            if (record == null) continue;
 
-        for (SObject record : Database.query(soql)) {
             // Re-masking would overwrite the log with encrypted placeholders and lose the original data
-            if ((Boolean) record.get(statusFieldName) == true) {
-                alreadyMasked++;
+            if ((Boolean) record.get(plan.statusField) == true) {
+                outcome.skippedCount++;
                 continue;
             }
 
-            List<String> logLines = new List<String>();
-            for (Schema.DescribeFieldResult fieldDescribe : targetFields) {
-                String apiName = fieldDescribe.getName();
-                String plainText = FlowAES256Util.toText(record.get(apiName), fieldDescribe.getType());
+            try {
+                SObject change = outcome.sObjectType.newSObject(recordId);
+                List<String> logLines = new List<String>();
+                for (Schema.DescribeFieldResult fieldDescribe : plan.targetFields) {
+                    String apiName = fieldDescribe.getName();
+                    String plainText = FlowAES256Util.toText(record.get(apiName), fieldDescribe.getType());
 
-                if (plainText != null) {
-                    logLines.add(apiName + FlowAES256Util.LOG_SEPARATOR + FlowAES256Util.encrypt(keyBlob, plainText));
+                    if (plainText != null) {
+                        logLines.add(apiName + FlowAES256Util.LOG_SEPARATOR + FlowAES256Util.encrypt(plan.key, plainText));
+                    }
+                    change.put(apiName, FlowAES256Util.maskValueFor(fieldDescribe, plan.placeholder));
                 }
-                record.put(apiName, FlowAES256Util.maskValueFor(fieldDescribe));
+
+                String log = FlowAES256Util.buildLog(plan.keyName, logLines);
+                if (log.length() > plan.logField.getLength()) {
+                    throw new FlowAES256Util.AES256Exception('the encrypted log needs ' + log.length()
+                        + ' characters but ' + encField + ' holds ' + plan.logField.getLength());
+                }
+
+                change.put(encField, log);
+                change.put(plan.statusField, true);
+                outcome.changes.add(change);
+            } catch (Exception e) {
+                outcome.fail(recordId, e.getMessage());
             }
-
-            String log = String.join(logLines, '\n');
-            if (log.length() > logField.getLength()) {
-                throw new FlowAES256Util.AES256Exception('No records changed. The encrypted log for ' + record.Id + ' needs '
-                    + log.length() + ' characters but ' + encField + ' holds ' + logField.getLength() + '.');
-            }
-
-            record.put(encField, log);
-            record.put(statusFieldName, true);
-            recordsToUpdate.add(record);
         }
-
-        if (!recordsToUpdate.isEmpty()) {
-            update recordsToUpdate;
-        }
-
-        String message = 'SUCCESS: Processed ' + recordsToUpdate.size() + ' records.';
-        if (alreadyMasked > 0) {
-            message += ' Skipped ' + alreadyMasked + ' already masked records.';
-        }
-        return result(true, message);
     }
 
-    private static MaskResult result(Boolean isSuccess, String message) {
+    private static MaskResult toResult(FlowAES256Service.Outcome outcome) {
         MaskResult res = new MaskResult();
-        res.isSuccess = isSuccess;
-        res.message = message;
+        res.isSuccess = outcome.isSuccess();
+        res.message = outcome.message('Processed', 'already masked records');
+        res.processedCount = outcome.processedCount;
+        res.skippedCount = outcome.skippedCount;
+        res.failedCount = outcome.failedCount();
+        res.failedRecordIds = outcome.failedRecordIds;
         return res;
     }
 

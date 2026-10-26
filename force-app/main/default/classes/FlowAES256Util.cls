@@ -1,5 +1,5 @@
 /**
- * Shared helpers for FlowAES256DataMaskingAction and FlowAES256DataUnmaskingAction:
+ * Shared helpers for the AES256 Flow actions:
  * key retrieval, encryption, field validation and type-safe conversion of field values
  * to and from the plain text that is encrypted into the audit log.
  */
@@ -40,33 +40,60 @@ public inherited sharing class FlowAES256Util {
         Schema.DisplayType.BOOLEAN
     };
 
-    // Lets unit tests supply a key, as Custom Metadata records cannot be inserted in tests
+    // First line of every log written by this version, naming the key that encrypted it
+    public static final String KEY_HEADER = '#key' + LOG_SEPARATOR;
+
+    // Keys are read once per transaction, however many Flow interviews ask for them
+    private static Map<String, Blob> keyCache = new Map<String, Blob>();
+
+    // Lets unit tests supply keys, as Custom Metadata records cannot be inserted in tests
     @TestVisible
-    private static String keyOverride;
+    private static Map<String, String> testKeys;
+
+    @TestVisible
+    private static void setTestKey(String keyName, String encodedKey) {
+        if (testKeys == null) testKeys = new Map<String, String>();
+        testKeys.put(resolveKeyName(keyName), encodedKey);
+        keyCache.clear();
+    }
+
+    // A blank key name means the Default_Key record
+    public static String resolveKeyName(String keyName) {
+        return String.isBlank(keyName) ? KEY_RECORD_NAME : keyName.trim();
+    }
 
     public static Blob getKey() {
+        return getKey(KEY_RECORD_NAME);
+    }
+
+    public static Blob getKey(String keyName) {
+        String name = resolveKeyName(keyName);
+        Blob cached = keyCache.get(name);
+        if (cached != null) return cached;
+
         String encodedKey;
-        if (keyOverride != null) {
-            encodedKey = keyOverride;
+        if (testKeys != null) {
+            encodedKey = testKeys.get(name);
         } else {
-            Symmetric_Key_Config__mdt config = Symmetric_Key_Config__mdt.getInstance(KEY_RECORD_NAME);
+            Symmetric_Key_Config__mdt config = Symmetric_Key_Config__mdt.getInstance(name);
             encodedKey = config?.AES_Key__c;
         }
 
         if (String.isBlank(encodedKey)) {
-            throw new AES256Exception('Symmetric Key Custom Metadata record (' + KEY_RECORD_NAME + ') missing or blank.');
+            throw new AES256Exception('Symmetric Key Custom Metadata record (' + name + ') missing or blank.');
         }
 
         Blob key;
         try {
             key = EncodingUtil.base64Decode(encodedKey.trim());
         } catch (Exception e) {
-            throw new AES256Exception('AES key in ' + KEY_RECORD_NAME + ' is not valid Base64.');
+            throw new AES256Exception('AES key in ' + name + ' is not valid Base64.');
         }
         if (key == null || key.size() != KEY_BYTES) {
-            throw new AES256Exception('AES key in ' + KEY_RECORD_NAME + ' must decode to exactly ' + KEY_BYTES
+            throw new AES256Exception('AES key in ' + name + ' must decode to exactly ' + KEY_BYTES
                 + ' bytes. Generate one with: openssl rand -base64 32');
         }
+        keyCache.put(name, key);
         return key;
     }
 
@@ -119,9 +146,17 @@ public inherited sharing class FlowAES256Util {
     }
 
     public static Object maskValueFor(Schema.DescribeFieldResult field) {
+        return maskValueFor(field, null);
+    }
+
+    // A blank placeholder falls back to MASK_PLACEHOLDER; it is cut to the field's length so the update cannot fail
+    public static Object maskValueFor(Schema.DescribeFieldResult field, String placeholder) {
         if (field.getType() == Schema.DisplayType.BOOLEAN) return false;
         if (field.isNillable()) return null;
-        if (TEXT_TYPES.contains(field.getType())) return MASK_PLACEHOLDER.left(Math.max(field.getLength(), 1));
+        if (TEXT_TYPES.contains(field.getType())) {
+            String value = String.isBlank(placeholder) ? MASK_PLACEHOLDER : placeholder;
+            return value.left(Math.max(field.getLength(), 1));
+        }
         throw new AES256Exception(field.getName() + ' is required and cannot be masked.');
     }
 
@@ -183,6 +218,18 @@ public inherited sharing class FlowAES256Util {
             if (secondParts.size() > 1) milliseconds = Integer.valueOf(secondParts[1]);
         }
         return Time.newInstance(Integer.valueOf(parts[0]), Integer.valueOf(parts[1]), seconds, milliseconds);
+    }
+
+    public static String buildLog(String keyName, List<String> fieldLines) {
+        List<String> lines = new List<String>{ KEY_HEADER + resolveKeyName(keyName) };
+        lines.addAll(fieldLines);
+        return String.join(lines, '\n');
+    }
+
+    // Returns the key named in the log header, or null for logs written before the header existed
+    public static String readKeyName(List<String> logLines) {
+        if (logLines.isEmpty() || !logLines[0].startsWith(KEY_HEADER)) return null;
+        return logLines[0].substring(KEY_HEADER.length()).trim();
     }
 
     // Splits the log into lines, tolerating the HTML a Rich Text Area adds around plain text

@@ -84,15 +84,60 @@ private class FlowAES256UtilTest {
     @IsTest
     static void testGetKeyValidatesKey() {
         Blob key = Crypto.generateAesKey(256);
-        FlowAES256Util.keyOverride = ' ' + EncodingUtil.base64Encode(key) + ' ';
+        FlowAES256Util.setTestKey(null, ' ' + EncodingUtil.base64Encode(key) + ' ');
         System.assertEquals(EncodingUtil.base64Encode(key), EncodingUtil.base64Encode(FlowAES256Util.getKey()));
+        System.assertEquals(EncodingUtil.base64Encode(key), EncodingUtil.base64Encode(FlowAES256Util.getKey('  ')),
+            'A blank key name means Default_Key');
 
         assertKeyRejected('', 'missing or blank');
         assertKeyRejected(EncodingUtil.base64Encode(Crypto.generateAesKey(128)), '32 bytes');
     }
 
+    @IsTest
+    static void testNamedKeysAreSeparateAndCached() {
+        String defaultKey = FlowAES256TestData.useNewKey();
+        String regionKey = FlowAES256TestData.useNewKey('EU_Key');
+
+        System.assertEquals(defaultKey, EncodingUtil.base64Encode(FlowAES256Util.getKey()));
+        System.assertEquals(regionKey, EncodingUtil.base64Encode(FlowAES256Util.getKey(' EU_Key ')));
+
+        try {
+            FlowAES256Util.getKey('Unknown_Key');
+            System.assert(false, 'Expected an unknown key name to be rejected');
+        } catch (FlowAES256Util.AES256Exception e) {
+            System.assert(e.getMessage().contains('(Unknown_Key) missing or blank'), e.getMessage());
+        }
+
+        Integer queriesBefore = Limits.getQueries();
+        for (Integer i = 0; i < 200; i++) {
+            FlowAES256Util.getKey('EU_Key');
+        }
+        System.assertEquals(queriesBefore, Limits.getQueries(), 'Key look-ups must not use SOQL');
+    }
+
+    @IsTest
+    static void testLogHeaderNamesTheKey() {
+        String log = FlowAES256Util.buildLog(null, new List<String>{ 'Email: abc' });
+        List<String> lines = FlowAES256Util.splitLogLines(log);
+
+        System.assertEquals('#key: Default_Key\nEmail: abc', log);
+        System.assertEquals('Default_Key', FlowAES256Util.readKeyName(lines));
+        System.assertEquals('EU_Key', FlowAES256Util.readKeyName(FlowAES256Util.splitLogLines(FlowAES256Util.buildLog('EU_Key', new List<String>()))));
+        System.assertEquals(null, FlowAES256Util.readKeyName(new List<String>{ 'Email: abc' }), 'Logs from earlier versions have no header');
+        System.assertEquals(null, FlowAES256Util.readKeyName(new List<String>()));
+    }
+
+    @IsTest
+    static void testCustomPlaceholderIsCutToFieldLength() {
+        Schema.DescribeFieldResult lastName = Contact.LastName.getDescribe();
+        System.assertEquals('REDACTED', FlowAES256Util.maskValueFor(lastName, 'REDACTED'));
+        System.assertEquals(FlowAES256Util.MASK_PLACEHOLDER, FlowAES256Util.maskValueFor(lastName, ' '));
+        System.assertEquals(lastName.getLength(), ((String) FlowAES256Util.maskValueFor(lastName, 'x'.repeat(500))).length());
+        System.assertEquals(null, FlowAES256Util.maskValueFor(Contact.Email.getDescribe(), 'REDACTED'), 'Optional fields are still blanked');
+    }
+
     private static void assertKeyRejected(String encodedKey, String expectedMessage) {
-        FlowAES256Util.keyOverride = encodedKey;
+        FlowAES256Util.setTestKey(null, encodedKey);
         try {
             FlowAES256Util.getKey();
             System.assert(false, 'Expected key "' + encodedKey + '" to be rejected');

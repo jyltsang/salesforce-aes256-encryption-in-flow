@@ -17,9 +17,14 @@ public class FlowAES256TestData {
         'MailingAddress', 'Email', 'Birthdate', 'LastName', 'HasOptedOutOfEmail', 'Phone'
     };
 
+    // Replaces the Default_Key record with a freshly generated key
     public static String useNewKey() {
+        return useNewKey(FlowAES256Util.KEY_RECORD_NAME);
+    }
+
+    public static String useNewKey(String keyName) {
         String encodedKey = EncodingUtil.base64Encode(Crypto.generateAesKey(256));
-        FlowAES256Util.keyOverride = encodedKey;
+        FlowAES256Util.setTestKey(keyName, encodedKey);
         return encodedKey;
     }
 
@@ -43,16 +48,23 @@ public class FlowAES256TestData {
     }
 
     public static Lead insertLead() {
-        Lead l = new Lead(
-            LastName = 'Turing',
-            Company = 'Bletchley Ltd',
-            NumberOfEmployees = 250,
-            AnnualRevenue = 1234567.89,
-            PostalCode = '01234',
-            Email = 'alan@example.com'
-        );
-        insert l;
-        return l;
+        return insertLeads(1)[0];
+    }
+
+    public static List<Lead> insertLeads(Integer count) {
+        List<Lead> leads = new List<Lead>();
+        for (Integer i = 0; i < count; i++) {
+            leads.add(new Lead(
+                LastName = 'Turing ' + i,
+                Company = 'Bletchley Ltd',
+                NumberOfEmployees = 250,
+                AnnualRevenue = 1234567.89,
+                PostalCode = '01234',
+                Email = 'alan@example.com'
+            ));
+        }
+        insert leads;
+        return leads;
     }
 
     public static Contact requeryContact(Id contactId) {
@@ -70,20 +82,36 @@ public class FlowAES256TestData {
         ];
     }
 
-    public static FlowAES256DataMaskingAction.MaskResult mask(List<SObject> records, List<String> fieldNames) {
+    public static FlowAES256DataMaskingAction.MaskRequest maskRequest(List<SObject> records, List<String> fieldNames) {
         FlowAES256DataMaskingAction.MaskRequest req = new FlowAES256DataMaskingAction.MaskRequest();
         req.recordsToMask = records;
         req.fieldNamesCollection = fieldNames;
         req.encryptedLogFieldName = LOG_FIELD;
         req.statusCheckboxFieldName = STATUS_FIELD;
+        return req;
+    }
+
+    public static FlowAES256DataMaskingAction.MaskResult mask(FlowAES256DataMaskingAction.MaskRequest req) {
         return FlowAES256DataMaskingAction.processRecords(new List<FlowAES256DataMaskingAction.MaskRequest>{ req })[0];
     }
 
-    public static FlowAES256DataUnmaskingAction.UnmaskResult unmask(List<SObject> records) {
+    public static FlowAES256DataMaskingAction.MaskResult mask(List<SObject> records, List<String> fieldNames) {
+        return mask(maskRequest(records, fieldNames));
+    }
+
+    public static FlowAES256DataUnmaskingAction.UnmaskRequest unmaskRequest(List<SObject> records) {
         FlowAES256DataUnmaskingAction.UnmaskRequest req = new FlowAES256DataUnmaskingAction.UnmaskRequest();
         req.recordsToUnmask = records;
         req.encryptedLogFieldName = LOG_FIELD;
         req.statusCheckboxFieldName = STATUS_FIELD;
+        return req;
+    }
+
+    public static FlowAES256DataUnmaskingAction.UnmaskResult unmask(FlowAES256DataUnmaskingAction.UnmaskRequest req) {
         return FlowAES256DataUnmaskingAction.processRecords(new List<FlowAES256DataUnmaskingAction.UnmaskRequest>{ req })[0];
+    }
+
+    public static FlowAES256DataUnmaskingAction.UnmaskResult unmask(List<SObject> records) {
+        return unmask(unmaskRequest(records));
     }
 }
