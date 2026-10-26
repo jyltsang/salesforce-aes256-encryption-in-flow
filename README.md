@@ -61,12 +61,21 @@ To securely store and supply the AES key dynamically to Apex:
 
 ### 3. Create Necessary Salesforce Fields
 To store the encrypted values and track status, create the following fields on your target object (e.g., Contact):
-* **Encrypted Log Field:** Text Area (Rich) maximised to **131,072 characters** to store the complete audit logs (capable of holding logs for up to 400 fields).
+* **Encrypted Log Field:** Text Area (Long) maximised to **131,072 characters** to store the complete audit logs (capable of holding logs for up to 400 fields). A Long Text Area is recommended: a Rich Text Area also works, as the unmasking action strips the HTML it adds, but it offers no benefit for machine-written logs.
 * **Status Checkbox Field:** Checkbox field to track whether the record is currently masked.
 
 ### 4. Deploy Apex Classes
 
-Deploy both `FlowAES256DataMaskingAction.cls` and `FlowAES256DataUnmaskingAction.cls` into your Salesforce environment via Developer Console or VS Code.
+Deploy `FlowAES256Util.cls`, `FlowAES256DataMaskingAction.cls` and `FlowAES256DataUnmaskingAction.cls`, together with the test classes (`FlowAES256TestData`, `FlowAES256UtilTest`, `FlowAES256DataMaskingActionTest`, `FlowAES256DataUnmaskingActionTest`), into your Salesforce environment via VS Code or the Salesforce CLI. Production deployments require the tests to pass.
+
+The repository is a Salesforce DX project and also contains the `Symmetric_Key_Config__mdt` type and its `AES_Key__c` field, so you can skip the manual steps in section 2 (apart from creating the `Default_Key` record) and deploy everything with:
+
+```bash
+sf project deploy start --source-dir force-app --test-level RunSpecifiedTests \
+  --tests FlowAES256UtilTest --tests FlowAES256DataMaskingActionTest --tests FlowAES256DataUnmaskingActionTest
+```
+
+The tests use only standard Contact and Lead fields (`Description` as the log field and `DoNotCall` as the status checkbox) and supply their own key, so they need no custom fields or Custom Metadata records. Validation rules or required custom fields on Contact or Lead in your org may need test adjustments.
 
 ---
 
@@ -88,3 +97,21 @@ Similar to masking, but you do not need to specify individual fields for unmaski
   3. **Checkbox Field** (Status Checkbox API name to reset)
 
 _(Note: The unmasking action automatically parses field API names from the encrypted audit log and restores original values without requiring manual field mapping)._
+
+---
+
+### 6. Supported Field Types & Behaviour
+
+| Field type | Masked value | Restored as |
+|---|---|---|
+| Text, Text Area, Phone, URL, Email, Picklist, postcode and other address parts | blank (`*****` if the field is required text) | original text, including leading zeros and line breaks |
+| Number, Currency, Percent | blank | original number |
+| Date, Date/Time, Time | blank | original value (Date/Time is logged in GMT, so it is unaffected by the user's time zone) |
+| Checkbox | unticked | original true/false |
+| Lookup | blank | original record Id |
+
+* **Validation before any change:** if a field does not exist, is not editable by the running user, is an unsupported compound type, or is required and cannot be blanked (e.g. a required number or picklist field), the masking action changes nothing and reports every problem in **Message**.
+* **Already-masked records are skipped:** masking a record whose checkbox is already ticked would overwrite its log with the masked placeholders and lose the original data, so such records are left untouched and counted in **Message**.
+* **Unmasking never destroys a log it could not read:** if any line of a record's log cannot be decrypted (e.g. the key has changed or the log was edited) or converted back to the field's type, that record is left masked with its log intact and listed in **Message**; the other records are still restored.
+* **Log length:** if the encrypted log would not fit in the log field, the action fails before changing anything.
+* **Bulk limits:** each Flow interview passed to the action runs its own queries and update, so a record-triggered Flow processing a large batch can still reach SOQL/DML governor limits. Prefer passing one collection of records per action call.

@@ -3,10 +3,10 @@ public with sharing class FlowAES256DataUnmaskingAction {
     public class UnmaskRequest {
         @InvocableVariable(required=true label='Object' description='Collection of records to unmask')
         public List<SObject> recordsToUnmask;
-        
+
         @InvocableVariable(required=true label='Log Field' description='API Name of the field storing the audit log')
         public String encryptedLogFieldName;
-        
+
         @InvocableVariable(required=true label='Checkbox Field' description='API Name of the checkbox status field to reset')
         public String statusCheckboxFieldName;
     }
@@ -14,7 +14,7 @@ public with sharing class FlowAES256DataUnmaskingAction {
     public class UnmaskResult {
         @InvocableVariable(label='Success Flag')
         public Boolean isSuccess;
-        
+
         @InvocableVariable(label='Message')
         public String message;
     }
@@ -24,127 +24,135 @@ public with sharing class FlowAES256DataUnmaskingAction {
         List<UnmaskResult> results = new List<UnmaskResult>();
 
         // Retrieve AES key dynamically from Custom Metadata Type
-        Symmetric_Key_Config__mdt config = Symmetric_Key_Config__mdt.getInstance('Default_Key');
-        if (config == null || String.isBlank(config.AES_Key__c)) {
+        Blob keyBlob;
+        try {
+            keyBlob = FlowAES256Util.getKey();
+        } catch (FlowAES256Util.AES256Exception e) {
             for (UnmaskRequest req : requests) {
-                UnmaskResult err = new UnmaskResult();
-                err.isSuccess = false;
-                err.message = 'ERROR: Symmetric Key Custom Metadata record (Default_Key) missing or blank.';
-                results.add(err);
+                results.add(result(false, 'ERROR: ' + e.getMessage()));
             }
             return results;
         }
 
-        Blob keyBlob = EncodingUtil.base64Decode(config.AES_Key__c.trim());
-
         for (UnmaskRequest req : requests) {
-            UnmaskResult res = new UnmaskResult();
             try {
-                if (req.recordsToUnmask == null || req.recordsToUnmask.isEmpty()) {
-                    res.isSuccess = false;
-                    res.message = 'No records provided in the collection.';
-                    results.add(res);
-                    continue;
-                }
-
-                Id firstId = req.recordsToUnmask[0].Id;
-                Schema.SObjectType sObjectType = firstId.getSObjectType();
-                String objectName = sObjectType.getDescribe().getName();
-                Map<String, Schema.SObjectField> fieldMap = sObjectType.getDescribe().fields.getMap();
-
-                Set<Id> recordIds = new Set<Id>();
-                for (SObject sObj : req.recordsToUnmask) {
-                    recordIds.add(sObj.Id);
-                }
-
-                String encField = req.encryptedLogFieldName.trim();
-                String statusField = req.statusCheckboxFieldName.trim();
-
-                // Query live records including the log field
-                String soql = 'SELECT Id, ' + encField + ' FROM ' + objectName + ' WHERE Id IN :recordIds';
-                List<SObject> queriedRecords = Database.query(soql);
-                
-                // Collect all unique fields we need to query and update
-                Set<String> allParsedFields = new Set<String>();
-                Map<Id, Map<String, String>> recordToValMap = new Map<Id, Map<String, String>>();
-
-                for (SObject record : queriedRecords) {
-                    String logContent = (String) record.get(encField);
-                    if (String.isBlank(logContent)) continue;
-
-                    Map<String, String> decryptedFieldValues = new Map<String, String>();
-                    
-                    // Parse multiline format: FieldName: EncryptedBase64String
-                    List<String> lines = logContent.split('\n');
-                    for (String line : lines) {
-                        List<String> parts = line.split(': ');
-                        if (parts.size() == 2) {
-                            String fName = parts[0].trim();
-                            String b64Cipher = parts[1].trim();
-
-                            try {
-                                Blob encryptedBlob = EncodingUtil.base64Decode(b64Cipher);
-                                Blob decryptedBlob = Crypto.decryptWithManagedIV('AES256', keyBlob, encryptedBlob);
-                                String originalVal = decryptedBlob.toString();
-
-                                decryptedFieldValues.put(fName, originalVal);
-                                allParsedFields.add(fName);
-                            } catch (Exception decryptEx) {
-                                // Skip line if decryption fails
-                            }
-                        }
-                    }
-                    recordToValMap.put(record.Id, decryptedFieldValues);
-                }
-
-                if (allParsedFields.isEmpty()) {
-                    res.isSuccess = false;
-                    res.message = 'No valid encrypted logs found to decrypt.';
-                    results.add(res);
-                    continue;
-                }
-
-                // Query the actual target fields that were found in the logs
-                allParsedFields.add(encField);
-                allParsedFields.add(statusField);
-                String fullSoql = 'SELECT Id, ' + String.join(new List<String>(allParsedFields), ', ') + 
-                                  ' FROM ' + objectName + ' WHERE Id IN :recordIds';
-                
-                List<SObject> fullRecords = Database.query(fullSoql);
-                List<SObject> recordsToUpdate = new List<SObject>();
-
-                for (SObject record : fullRecords) {
-                    Id recId = record.Id;
-                    if (!recordToValMap.containsKey(recId)) continue;
-
-                    Map<String, String> fieldVals = recordToValMap.get(recId);
-                    for (String fName : fieldVals.keySet()) {
-                        if (fieldMap.containsKey(fName.toLowerCase())) {
-                            record.put(fName, fieldVals.get(fName));
-                        }
-                    }
-
-                    // Clear the log and reset status checkbox
-                    record.put(encField, null);
-                    record.put(statusField, false);
-
-                    recordsToUpdate.add(record);
-                }
-
-                if (!recordsToUpdate.isEmpty()) {
-                    update recordsToUpdate;
-                }
-
-                res.isSuccess = true;
-                res.message = 'SUCCESS: Unmasked ' + recordsToUpdate.size() + ' records.';
-
+                results.add(unmaskRecords(req, keyBlob));
             } catch (Exception e) {
-                res.isSuccess = false;
-                res.message = 'ERROR: ' + e.getMessage();
+                results.add(result(false, 'ERROR: ' + e.getMessage()));
             }
-            results.add(res);
         }
 
         return results;
+    }
+
+    private static UnmaskResult unmaskRecords(UnmaskRequest req, Blob keyBlob) {
+        if (req.recordsToUnmask == null || req.recordsToUnmask.isEmpty()) {
+            return result(false, 'No records provided in the collection.');
+        }
+
+        Schema.SObjectType sObjectType = req.recordsToUnmask[0].getSObjectType();
+        String objectName = sObjectType.getDescribe().getName();
+        Map<String, Schema.SObjectField> fieldMap = sObjectType.getDescribe().fields.getMap();
+
+        String encField = FlowAES256Util.requireField(
+            fieldMap, req.encryptedLogFieldName, objectName, 'Log field', FlowAES256Util.LOG_FIELD_TYPES, 'a text area field').getName();
+        String statusField = FlowAES256Util.requireField(
+            fieldMap, req.statusCheckboxFieldName, objectName, 'Checkbox field', FlowAES256Util.STATUS_FIELD_TYPES, 'a checkbox').getName();
+
+        Set<Id> recordIds = new Set<Id>();
+        for (SObject sObj : req.recordsToUnmask) {
+            if (sObj != null && sObj.Id != null) recordIds.add(sObj.Id);
+        }
+
+        // Query live records including the log field
+        String soql = 'SELECT Id, ' + encField + ', ' + statusField + ' FROM ' + objectName + ' WHERE Id IN :recordIds';
+
+        List<SObject> recordsToUpdate = new List<SObject>();
+        List<String> failures = new List<String>();
+
+        for (SObject record : Database.query(soql)) {
+            String logContent = (String) record.get(encField);
+            if (String.isBlank(logContent)) {
+                // Masked while every target field was empty, so there is nothing to restore
+                if ((Boolean) record.get(statusField) == true) {
+                    SObject reset = sObjectType.newSObject(record.Id);
+                    reset.put(statusField, false);
+                    recordsToUpdate.add(reset);
+                }
+                continue;
+            }
+
+            // A record is restored only if every line decrypts; otherwise its log is kept so no data is lost
+            try {
+                recordsToUpdate.add(restoreRecord(sObjectType, fieldMap, record.Id, logContent, keyBlob, encField, statusField));
+            } catch (Exception e) {
+                failures.add(record.Id + ' (' + e.getMessage() + ')');
+            }
+        }
+
+        if (!recordsToUpdate.isEmpty()) {
+            update recordsToUpdate;
+        }
+
+        if (!failures.isEmpty()) {
+            return result(false, 'ERROR: Unmasked ' + recordsToUpdate.size() + ' records. '
+                + failures.size() + ' records were left masked with their log intact: ' + String.join(failures, '; '));
+        }
+        if (recordsToUpdate.isEmpty()) {
+            return result(false, 'No valid encrypted logs found to decrypt.');
+        }
+        return result(true, 'SUCCESS: Unmasked ' + recordsToUpdate.size() + ' records.');
+    }
+
+    // Parses the multiline log format 'FieldName: EncryptedBase64String' into a record ready to update
+    private static SObject restoreRecord(
+        Schema.SObjectType sObjectType,
+        Map<String, Schema.SObjectField> fieldMap,
+        Id recordId,
+        String logContent,
+        Blob keyBlob,
+        String encField,
+        String statusField
+    ) {
+        SObject restored = sObjectType.newSObject(recordId);
+
+        for (String line : FlowAES256Util.splitLogLines(logContent)) {
+            Integer separatorIndex = line.indexOf(FlowAES256Util.LOG_SEPARATOR);
+            if (separatorIndex < 1) {
+                throw new FlowAES256Util.AES256Exception('unreadable log line');
+            }
+
+            String fieldName = line.left(separatorIndex).trim();
+            Schema.DescribeFieldResult fieldDescribe = FlowAES256Util.describeField(fieldMap, fieldName);
+            if (fieldDescribe == null || !fieldDescribe.isUpdateable()) {
+                throw new FlowAES256Util.AES256Exception(fieldName + ' does not exist or is not editable');
+            }
+
+            String originalVal;
+            try {
+                originalVal = FlowAES256Util.decrypt(keyBlob, line.substring(separatorIndex + FlowAES256Util.LOG_SEPARATOR.length()).trim());
+            } catch (Exception decryptEx) {
+                throw new FlowAES256Util.AES256Exception('could not decrypt ' + fieldName
+                    + '; the log may have been altered or the key changed');
+            }
+
+            try {
+                restored.put(fieldDescribe.getName(), FlowAES256Util.toFieldValue(originalVal, fieldDescribe.getType()));
+            } catch (Exception convertEx) {
+                throw new FlowAES256Util.AES256Exception('could not restore ' + fieldName + ': ' + convertEx.getMessage());
+            }
+        }
+
+        // Clear the log and reset status checkbox
+        restored.put(encField, null);
+        restored.put(statusField, false);
+        return restored;
+    }
+
+    private static UnmaskResult result(Boolean isSuccess, String message) {
+        UnmaskResult res = new UnmaskResult();
+        res.isSuccess = isSuccess;
+        res.message = message;
+        return res;
     }
 }
