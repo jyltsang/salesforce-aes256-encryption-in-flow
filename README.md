@@ -14,9 +14,8 @@ Flow-callable Apex actions that encrypt chosen field values with AES-256 into a 
 6. [Design decisions](#design-decisions)
 7. [Limitations](#limitations)
 8. [Test steps](#test-steps)
-9. [Demo](#demo)
-10. [Security reporting](#security-reporting)
-11. [Licence](#licence)
+9. [Security reporting](#security-reporting)
+10. [Licence](#licence)
 
 Supporting documents: [reference](docs/reference.md) (Flow inputs, field handling, limits, rotation), [full threat model](docs/threat-model.md), [claim-by-claim verification](docs/verification.md), [unverified items](docs/unverified.md) and the [demo script](docs/demo-script.md).
 
@@ -259,12 +258,6 @@ This list is intentionally longer than the claims above.
 11. **Rotation check.** Create `Key_Test` with a new key. Run masking with **Key Name** = `Key_Test`. Expected: the log starts `#key: Key_Test`. Run unmasking without a key name. Expected: restored, because the log names its key.
 
 12. **Clean up.** Delete the dummy Contact and the test key records.
-
-## Demo
-
-A numbered script for a 3 to 5 minute screen recording is in [docs/demo-script.md](docs/demo-script.md).
-
-**Recording link:** _to be added (placeholder)_
 
 ## Security reporting
 
