@@ -42,7 +42,7 @@ private class FlowAES256DataUnmaskingActionTest {
         System.assertEquals(250, restored.NumberOfEmployees);
         System.assertEquals(1234567.89, restored.AnnualRevenue);
         System.assertEquals('01234', restored.PostalCode, 'Leading zeros in a postcode are kept');
-        System.assertEquals('alan@example.com', restored.Email);
+        System.assertEquals('person.two@example.com', restored.Email);
         System.assertEquals(null, restored.Description);
         System.assertEquals(false, restored.DoNotCall);
     }
