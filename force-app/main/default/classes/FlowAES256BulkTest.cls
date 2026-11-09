@@ -132,7 +132,7 @@ private class FlowAES256BulkTest {
         System.assert(!results[0].isSuccess);
         System.assert(results[0].message.startsWith('ERROR: No records changed because 1 records failed'), results[0].message);
         System.assertEquals(new List<String>{ leads[0].Id }, results[0].failedRecordIds);
-        System.assertEquals('alan@example.com', FlowAES256TestData.requeryLead(leads[1].Id).Email, 'Rolled back with its request');
+        System.assertEquals('person.two@example.com', FlowAES256TestData.requeryLead(leads[1].Id).Email, 'Rolled back with its request');
 
         System.assert(results[1].isSuccess, results[1].message);
         System.assert(results[2].isSuccess, results[2].message);

@@ -1,0 +1,23 @@
+# Salesforce cache
+.sf/
+.sfdx/
+.localdevserver/
+deploy-options.json
+
+# Logs
+*.log
+
+# Local environment variables
+.env
+
+# Key material. A retrieved Custom Metadata record contains the AES key in plain text.
+# Never commit key records, key files or exported envelopes.
+force-app/main/default/customMetadata/Symmetric_Key_Config.*
+*.pem
+*.key
+
+# Editor and OS files
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

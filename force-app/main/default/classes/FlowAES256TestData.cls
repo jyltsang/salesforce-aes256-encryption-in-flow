@@ -10,7 +10,7 @@ public class FlowAES256TestData {
 
     public static final String STREET = '12 St James\'s Square\nFlat 3';
     public static final String POSTCODE = 'SW1Y 4JH';
-    public static final String EMAIL = 'ada@example.com';
+    public static final String EMAIL = 'person.one@example.com';
     public static final Date BIRTHDATE = Date.newInstance(1815, 12, 10);
 
     public static final List<String> CONTACT_FIELDS = new List<String>{
@@ -32,8 +32,8 @@ public class FlowAES256TestData {
         List<Contact> contacts = new List<Contact>();
         for (Integer i = 0; i < count; i++) {
             contacts.add(new Contact(
-                FirstName = 'Ada',
-                LastName = 'Lovelace ' + i,
+                FirstName = 'Test',
+                LastName = 'Contact ' + i,
                 Email = EMAIL,
                 Phone = '+44 20 7946 0000',
                 Birthdate = BIRTHDATE,
@@ -55,12 +55,12 @@ public class FlowAES256TestData {
         List<Lead> leads = new List<Lead>();
         for (Integer i = 0; i < count; i++) {
             leads.add(new Lead(
-                LastName = 'Turing ' + i,
-                Company = 'Bletchley Ltd',
+                LastName = 'Lead ' + i,
+                Company = 'Example Ltd',
                 NumberOfEmployees = 250,
                 AnnualRevenue = 1234567.89,
                 PostalCode = '01234',
-                Email = 'alan@example.com'
+                Email = 'person.two@example.com'
             ));
         }
         insert leads;
